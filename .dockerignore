@@ -1,0 +1,41 @@
+# Docker build context for the BACKEND image (root Dockerfile).
+# The frontend has its own Dockerfile and its own .dockerignore.
+
+# VCS / secrets
+.git
+.gitignore
+.gitattributes
+.env
+.env.*
+!.env.example
+
+# Frontend is built separately
+frontend/
+node_modules/
+
+# Python junk
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Local data, logs, scratch files
+*.db
+*.sqlite
+*.sqlite3
+*.log
+login.json
+order.json
+scripts/
+
+# Editors / OS / docs
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.md
+docker-compose*.yml

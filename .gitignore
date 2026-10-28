@@ -1,0 +1,52 @@
+# ---------- Secrets (never commit) ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+# temporary request bodies created while testing with curl / PowerShell
+login.json
+order.json
+*.local.json
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# ---------- Local databases ----------
+*.db
+*.sqlite
+*.sqlite3
+
+# ---------- Node / frontend ----------
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+# keep package-lock.json committed (reproducible installs)
+
+# ---------- Docker ----------
+docker-compose.override.yml
+
+# ---------- Logs ----------
+*.log
+logs/
+
+# ---------- Editors / OS ----------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

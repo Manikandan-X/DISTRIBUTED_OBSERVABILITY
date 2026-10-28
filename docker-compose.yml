@@ -1,0 +1,872 @@
+# Distributed Observability Platform - development stack.
+#
+#   docker compose up --build
+#
+# One MySQL server hosts one DATABASE PER SERVICE (obs_traces, obs_logs, ...);
+# no service reads another service's tables. The one-shot `migrate` container
+# creates the databases and applies each service's Alembic branch first.
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: observability_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+    ports:
+      - "3308:3306"
+    volumes:
+      - observability_mysql_data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -uroot -p\"$${MYSQL_ROOT_PASSWORD}\" --silent"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: observability_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    volumes:
+      - observability_rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_migrate
+    restart: "no"
+    command: ["python", "-m", "app.db.migrate"]
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+    volumes:
+      - ./app:/app/app
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # ---- Platform services -------------------------------------------------
+  api-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_api_gateway
+    restart: unless-stopped
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8001:8000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      JWT_SECRET: ${JWT_SECRET:-local_jwt_secret_change_me_to_a_long_random_string}
+      JWT_TTL_MINUTES: ${JWT_TTL_MINUTES:-60}
+      CONSOLE_ADMIN_USER: ${CONSOLE_ADMIN_USER:-admin}
+      CONSOLE_ADMIN_PASSWORD: ${CONSOLE_ADMIN_PASSWORD:-admin_password_change_me}
+      CONSOLE_ANALYST_USER: ${CONSOLE_ANALYST_USER:-analyst}
+      CONSOLE_ANALYST_PASSWORD: ${CONSOLE_ANALYST_PASSWORD:-analyst_password_change_me}
+      CONSOLE_VIEWER_USER: ${CONSOLE_VIEWER_USER:-viewer}
+      CONSOLE_VIEWER_PASSWORD: ${CONSOLE_VIEWER_PASSWORD:-viewer_password_change_me}
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      ingestion-service:
+        condition: service_healthy
+      query-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+  ingestion-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_ingestion_service
+    restart: unless-stopped
+    command: ["uvicorn", "app.apps.ingestion:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8010:8000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MYSQL_DATABASE: obs_ingestion
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+  trace-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_trace_service
+    restart: unless-stopped
+    command: ["uvicorn", "app.apps.trace_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8011:8000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MYSQL_DATABASE: obs_traces
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+  log-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_log_service
+    restart: unless-stopped
+    command: ["uvicorn", "app.apps.log_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8012:8000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MYSQL_DATABASE: obs_logs
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+  metrics-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_metrics_service
+    restart: unless-stopped
+    command: ["uvicorn", "app.apps.metrics_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8013:8000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MYSQL_DATABASE: obs_metrics
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+  rca-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_rca_service
+    restart: unless-stopped
+    command: ["uvicorn", "app.apps.rca_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8014:8000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MYSQL_DATABASE: obs_rca
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+  query-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_query_service
+    restart: unless-stopped
+    command: ["uvicorn", "app.apps.query_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8015:8000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+  # ---- Broker consumers -------------------------------------------------
+  trace-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_trace_consumer
+    restart: unless-stopped
+    command: ["python", "-m", "app.messaging.trace_consumer"]
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MYSQL_DATABASE: obs_traces
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+  log-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_log_consumer
+    restart: unless-stopped
+    command: ["python", "-m", "app.messaging.log_consumer"]
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MYSQL_DATABASE: obs_logs
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+  metric-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_metric_consumer
+    restart: unless-stopped
+    command: ["python", "-m", "app.messaging.metric_consumer"]
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MYSQL_DATABASE: obs_metrics
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+  # ---- Instrumented sample application (own databases) ------------------
+  notification-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_notification_service
+    restart: unless-stopped
+    command: ["uvicorn", "app.sample_services.notification_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8004:8000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MYSQL_DATABASE: obs_notifications
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      ingestion-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+  payment-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_payment_service
+    restart: unless-stopped
+    command: ["uvicorn", "app.sample_services.payment_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8003:8000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MYSQL_DATABASE: obs_payments
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      ingestion-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+  order-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observability_order_service
+    restart: unless-stopped
+    command: ["uvicorn", "app.sample_services.order_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8002:8000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_password_change_me}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-observability_dev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-local_rabbit_password_change_me}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local_internal_token_change_me}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-local_ingest_key_change_me}
+      INGESTION_API_KEY: ${INGESTION_API_KEY:-local_ingest_key_change_me}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      TRACE_SERVICE_URL: http://trace-service:8000
+      LOG_SERVICE_URL: http://log-service:8000
+      METRICS_SERVICE_URL: http://metrics-service:8000
+      RCA_SERVICE_URL: http://rca-service:8000
+      QUERY_SERVICE_URL: http://query-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+      PAYMENT_SERVICE_URL: http://payment-service:8000
+      NOTIFICATION_SERVICE_URL: http://notification-service:8000
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_BATCH_EVENTS: ${MAX_BATCH_EVENTS:-500}
+      DOWNSTREAM_TIMEOUT_SECONDS: ${DOWNSTREAM_TIMEOUT_SECONDS:-5}
+      DOWNSTREAM_MAX_ATTEMPTS: ${DOWNSTREAM_MAX_ATTEMPTS:-3}
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-8}
+      TRACE_COMPLETION_WAIT_SECONDS: ${TRACE_COMPLETION_WAIT_SECONDS:-30}
+      SLOW_SPAN_THRESHOLD_MS: ${SLOW_SPAN_THRESHOLD_MS:-500}
+      SLOW_TRACE_THRESHOLD_MS: ${SLOW_TRACE_THRESHOLD_MS:-1000}
+      METRIC_BUCKET_SECONDS: ${METRIC_BUCKET_SECONDS:-60}
+      ALERT_MIN_SAMPLES: ${ALERT_MIN_SAMPLES:-5}
+      ALERT_ERROR_RATE_PERCENT: ${ALERT_ERROR_RATE_PERCENT:-20}
+      ALERT_AVG_LATENCY_MS: ${ALERT_AVG_LATENCY_MS:-500}
+      ALERT_P95_LATENCY_MS: ${ALERT_P95_LATENCY_MS:-1000}
+      ALERT_REQUEST_VOLUME: ${ALERT_REQUEST_VOLUME:-1000}
+      ALERT_COOLDOWN_SECONDS: ${ALERT_COOLDOWN_SECONDS:-300}
+      DEFAULT_FAILURE_SCENARIO: ${DEFAULT_FAILURE_SCENARIO:-normal}
+      SLOW_PAYMENT_SECONDS: ${SLOW_PAYMENT_SECONDS:-2}
+      INTERMITTENT_FAILURE_RATE: ${INTERMITTENT_FAILURE_RATE:-0.5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MYSQL_DATABASE: obs_orders
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      ingestion-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---- Web console (React build served by nginx; /api is proxied to the gateway) ----
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: observability_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+
+volumes:
+  observability_mysql_data:
+  observability_rabbitmq_data:
